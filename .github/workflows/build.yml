@@ -34,7 +34,7 @@ jobs:
       - name: Compile Firmware
         run: |
           cd openwrt
-         make -j1 V=s name: Build OpenWrt
+         make -j1 V=s
 on:
   workflow_dispatch:
 
