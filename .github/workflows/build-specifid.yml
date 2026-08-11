@@ -40,3 +40,10 @@ jobs:
         run: |
           cd openwrt
           make -j1 V=s
+
+      # ⬇️ الخطوة المُضافة حديثاً لرفع المخرجات ⬇️
+      - name: Upload Firmware Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-redmi-ax3000-firmware
+          path: openwrt/bin/targets/**/*
