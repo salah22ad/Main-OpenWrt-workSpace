@@ -2,6 +2,29 @@ name: Build OpenWrt-specified-cr880x
 
 on:
   workflow_dispatch:
+    inputs:
+      include_assets:
+        description: 'Import external assets from building-helper (files/ runtime overlay + luci-theme-enan-dashboard). When FALSE, asset_profile and bh_token are completely ignored.'
+        required: false
+        default: false
+        type: boolean
+      asset_profile:
+        description: 'Asset profile to import (m/g/s folder from building-helper) — ONLY used when include_assets=true'
+        required: false
+        default: main
+        type: choice
+        options:
+          - main
+          - general
+          - special
+      bh_token:
+        description: 'Optional GitHub PAT (Contents:Read on a private building-helper repo). Leave empty for public. Consumed via env only and sanitized from all logs.'
+        required: false
+        default: ''
+        type: string
+
+env:
+  BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
 
 jobs:
   build:
@@ -10,6 +33,9 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Prepare logs directory
+        run: mkdir -p "$GITHUB_WORKSPACE/logs"
 
       - name: Initialization Environment
         env:
@@ -23,106 +49,218 @@ jobs:
       - name: Clone OpenWrt Source
         run: |
           set +e
-          mkdir -p logs
           git clone https://github.com/hzyitc/openwrt-redmi-ax3000.git openwrt
-          # نسخ مجلد target الخاص بك (الذي يحتوي على دعم Comfast / تعديلاتك)
           cp -r ./target openwrt/target
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          {
+            echo "base_repo = hzyitc/openwrt-redmi-ax3000"
+            echo "cloned_at = $(date -u +%FT%TZ)"
+            echo "head_sha  = $(git rev-parse HEAD)"
+          } | tee "$GITHUB_WORKSPACE/logs/clone.txt"
+
+      # =====================================================================
+      # v14: asset import from external building-helper (conditional)
+      #   Same logic as build-cf-wa350 v13.3:
+      #     main -> m/, general -> g/, special -> s/
+      #     - <sub>/files/                  -> openwrt/files/  (runtime overlay)
+      #     - <sub>/luci-theme-enan-dashboard -> openwrt/package/ (theme)
+      #   Token handling: empty -> public URL; non-empty -> PAT-authenticated URL.
+      # =====================================================================
+      - name: Import assets from building-helper (conditional)
+        if: ${{ inputs.include_assets == true }}
+        env:
+          BH_TOKEN: ${{ inputs.bh_token }}
+        run: |
+          set +e
+          LOG="$GITHUB_WORKSPACE/logs/building-helper.txt"
+          echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee -a "$LOG"
+          BH_DIR="/tmp/building-helper"
+          rm -rf "$BH_DIR"
+          BH_URL="$BUILDING_HELPER_REPO"
+          if [ -n "$BH_TOKEN" ]; then
+            BH_URL="https://x-access-token:${BH_TOKEN}@github.com/haddad2inc/building-helper.git"
+            echo "using dispatch-token authenticated clone (private building-helper)" | tee -a "$LOG"
+          else
+            echo "no bh_token provided -> using public clone URL" | tee -a "$LOG"
+          fi
+          if git clone --depth 1 "$BH_URL" "$BH_DIR" 2>&1 | sed 's|//[^:@/]*:@|//***:@|g' | tee -a "$LOG"; then
+            echo "✅ building-helper clone succeeded." | tee -a "$LOG"
+          else
+            echo "::error::building-helper clone FAILED."
+            exit 1
+          fi
+          rm -rf "$BH_DIR/.git"
+          echo "=== Contents of building-helper (top-level) ===" | tee -a "$LOG"
+          ls -la "$BH_DIR" | tee -a "$LOG"
+          case "${{ inputs.asset_profile }}" in
+            main)    SUB=m ;;
+            general) SUB=g ;;
+            special) SUB=s ;;
+            *)       echo "::error::unknown asset_profile '${{ inputs.asset_profile }}'"; exit 1 ;;
+          esac
+          SRC="$BH_DIR/$SUB"
+          echo "=== Selected subfolder: $SRC ===" | tee -a "$LOG"
+          if [ ! -d "$SRC" ]; then
+            echo "::error::asset_profile '${{ inputs.asset_profile }}' -> $SRC not found in building-helper."
+            ls -la "$BH_DIR" | tee -a "$LOG"
+            exit 1
+          fi
+          cd openwrt
+          # --- files/ runtime overlay ---
+          if [ -d "$SRC/files" ]; then
+            mkdir -p files
+            cp -rv "$SRC/files"/. files/ 2>&1 | tee -a "$LOG"
+            echo "✅ files/ injected from $SUB/files" | tee -a "$LOG"
+            find files -maxdepth 4 -type f | sort | tee -a "$LOG"
+          else
+            echo "ℹ️ $SRC/files not present — skipping files overlay." | tee -a "$LOG"
+          fi
+          # --- luci-theme-enan-dashboard package ---
+          if [ -d "$SRC/luci-theme-enan-dashboard" ]; then
+            TARGET_DIR="package/luci-theme-enan-dashboard"
+            mkdir -p package
+            rm -rf "$TARGET_DIR"
+            cp -rv "$SRC/luci-theme-enan-dashboard" package/ 2>&1 | tee -a "$LOG"
+            chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a "$LOG"
+            find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a "$LOG"
+            find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a "$LOG"
+            find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+            # v13.2-style license file modes, enforced in build tree
+            chmod 600 "$TARGET_DIR/root/usr/share/ucode/luci/.tplrc" 2>/dev/null || true
+            chmod 755 "$TARGET_DIR/root/usr/libexec/rpcd/netmon" 2>/dev/null || true
+            if [ -f "$TARGET_DIR/Makefile" ]; then
+              echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a "$LOG"
+              head -n 20 "$TARGET_DIR/Makefile" | tee -a "$LOG"
+            else
+              echo "::error::Makefile NOT found in $TARGET_DIR"
+              exit 1
+            fi
+          else
+            echo "ℹ️ $SRC/luci-theme-enan-dashboard not present — skipping theme package." | tee -a "$LOG"
+          fi
+          echo "=== Import completed for profile '${{ inputs.asset_profile }}' ===" | tee -a "$LOG"
+
+      - name: Skip assets notice (include_assets=false)
+        if: ${{ inputs.include_assets != true }}
+        run: |
+          LOG="$GITHUB_WORKSPACE/logs/building-helper.txt"
+          echo "=== include_assets=false -> skipping external asset import ===" | tee -a "$LOG"
+          echo "asset_profile input was: ${{ inputs.asset_profile }} (ignored)" | tee -a "$LOG"
+          echo "bh_token provided: $([ -n '${{ inputs.bh_token }}' ] && echo 'yes (ignored)' || echo 'no')" | tee -a "$LOG"
 
       # =====================================================================
       # إعداد الكونفيج + عرض فوري لكل ما تم تفعيله (لا انتظار حتى نهاية البناء)
+      # يُفعّل الثيم تلقائيًا إذا تم استيراده (include_assets=true + وجود package)
       # =====================================================================
       - name: Configure Custom Settings + Config Proof (immediate)
         run: |
           set +e
+          LOG="$GITHUB_WORKSPACE/logs/config-proof.txt"
           cd openwrt
           cp ../.config .config
-          make oldconfig
 
-          mkdir -p logs
-          echo "=== Target Info ===" | tee -a logs/config-proof.txt
-          grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=|^CONFIG_TARGET_ARCH_PACKAGES=' .config | tee -a logs/config-proof.txt
-          echo "" | tee -a logs/config-proof.txt
+          # ---- if theme was injected, enable it BEFORE oldconfig ----
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
+            echo "--- Theme package present; enabling CONFIG_PACKAGE_luci-theme-enan-dashboard=y ---" | tee -a "$LOG"
+            sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
+            sed -i '/^# CONFIG_PACKAGE_luci-theme-enan-dashboard is not set/d' .config
+            echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
+            # luci meta-package safety (theme depends on luci-base, but luci=y is harmless)
+            sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
+          fi
 
-          echo "=== Kernel / Image Options ===" | tee -a logs/config-proof.txt
-          grep -E '^CONFIG_LINUX_5_15=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_TARGET_ROOTFS_SQUASHFS=|^CONFIG_NAND_SUPPORT=|^CONFIG_GCC_VERSION=|^CONFIG_LIBC=' .config | tee -a logs/config-proof.txt
-          echo "" | tee -a logs/config-proof.txt
+          if ! make oldconfig; then
+            echo "::error::make oldconfig failed"
+            exit 1
+          fi
 
-          echo "=== Essential Packages (presence check) ===" | tee -a logs/config-proof.txt
-          for pkg in luci luci-base luci-mod-admin-full ethtool lldpd watchcat uhttpd \
+          # ---- config proof ----
+          echo "=== Target Info ===" | tee -a "$LOG"
+          grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=|^CONFIG_TARGET_ARCH_PACKAGES=' .config | tee -a "$LOG"
+          echo "" | tee -a "$LOG"
+
+          echo "=== Kernel / Image Options ===" | tee -a "$LOG"
+          grep -E '^CONFIG_LINUX_5_15=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_TARGET_ROOTFS_SQUASHFS=|^CONFIG_NAND_SUPPORT=|^CONFIG_GCC_VERSION=|^CONFIG_LIBC=' .config | tee -a "$LOG"
+          echo "" | tee -a "$LOG"
+
+          echo "=== Essential Packages (presence check) ===" | tee -a "$LOG"
+          for pkg in luci luci-base luci-mod-admin-full ethtool lldpd watchcat \
                      kmod-qca-ssdk kmod-qca-nss-dp kmod-ath11k kmod-ath11k-ahb \
-                     kmod-ath11k-pci ipq-wifi-redmi_ax3000 ath11k-firmware-ipq5018 ath11k-firmware-qcn6122; do
+                     kmod-ath11k-pci ipq-wifi-redmi_ax3000 ath11k-firmware-ipq5018 ath11k-firmware-qcn6122 \
+                     luci-theme-enan-dashboard; do
             if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "✅ CONFIG_PACKAGE_${pkg}=y" | tee -a logs/config-proof.txt
+              echo "✅ CONFIG_PACKAGE_${pkg}=y" | tee -a "$LOG"
             elif grep -q "^CONFIG_PACKAGE_${pkg}=m" .config; then
-              echo "🟡 CONFIG_PACKAGE_${pkg}=m" | tee -a logs/config-proof.txt
+              echo "🟡 CONFIG_PACKAGE_${pkg}=m" | tee -a "$LOG"
             else
-              echo "⚠️  CONFIG_PACKAGE_${pkg} غير مفعّلة" | tee -a logs/config-proof.txt
+              echo "⚠️  CONFIG_PACKAGE_${pkg} غير مفعّلة" | tee -a "$LOG"
             fi
           done
-          echo "" | tee -a logs/config-proof.txt
+          echo "" | tee -a "$LOG"
 
-          echo "=== All enabled packages (grep CONFIG_PACKAGE_*=y) ===" | tee -a logs/config-proof.txt
-          grep '^CONFIG_PACKAGE_.*=y' .config | sort | tee -a logs/config-proof.txt
-          echo "" | tee -a logs/config-proof.txt
+          echo "=== All enabled packages (grep CONFIG_PACKAGE_*=y) ===" | tee -a "$LOG"
+          grep '^CONFIG_PACKAGE_.*=y' .config | sort | tee -a "$LOG"
+          echo "" | tee -a "$LOG"
 
-          echo "=== .config hash (for artifact matching) ===" | tee -a logs/config-proof.txt
-          sha256sum .config | tee -a logs/config-proof.txt
-          cp .config logs/config.after-oldconfig.txt
+          echo "=== .config hash (for artifact matching) ===" | tee -a "$LOG"
+          sha256sum .config | tee -a "$LOG"
+          cp .config "$GITHUB_WORKSPACE/logs/config.after-oldconfig.txt"
 
-      # =====================================================================
-      # البناء باستخدام كل الأنوية
-      # =====================================================================
+          # ---- hard fail if theme was injected but ended up disabled ----
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
+            if ! grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
+              echo "::error::theme package present but CONFIG_PACKAGE_luci-theme-enan-dashboard!=y after oldconfig"
+              exit 1
+            fi
+            echo "✅ luci-theme-enan-dashboard enabled after oldconfig." | tee -a "$LOG"
+          fi
+
       - name: Compile Firmware
         run: |
           set +e
           cd openwrt
-          make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
+          make -j"$(nproc)" V=s 2>&1 | tee "$GITHUB_WORKSPACE/logs/build.log"
           rc=${PIPESTATUS[0]}
-
-          echo "=== Build output directory (ipq50xx/arm) ===" | tee -a logs/bin-list.txt
-          ls -la bin/targets/ipq50xx/arm/ 2>/dev/null | tee -a logs/bin-list.txt
-          echo "" | tee -a logs/bin-list.txt
-          echo "=== Full recursive listing (for sanity) ===" | tee -a logs/bin-list.txt
-          find bin/targets -maxdepth 3 -type f 2>/dev/null | sort | tee -a logs/bin-list.txt
-
-          echo "" | tee -a logs/images.sha256
-          echo "=== SHA256 of images (itb / ubi / bin) ===" | tee -a logs/images.sha256
-          sha256sum bin/targets/ipq50xx/arm/*.itb \
-                    bin/targets/ipq50xx/arm/*.ubi \
-                    bin/targets/ipq50xx/arm/*.bin 2>/dev/null | tee -a logs/images.sha256
+          {
+            echo "=== Build output directory (ipq50xx/arm) ==="
+            ls -la bin/targets/ipq50xx/arm/ 2>/dev/null
+            echo ""
+            echo "=== Full recursive listing (for sanity) ==="
+            find bin/targets -maxdepth 3 -type f 2>/dev/null | sort
+            echo ""
+            echo "=== SHA256 of images (itb / ubi / bin) ==="
+            sha256sum bin/targets/ipq50xx/arm/*.itb \
+                      bin/targets/ipq50xx/arm/*.ubi \
+                      bin/targets/ipq50xx/arm/*.bin 2>/dev/null
+          } | tee "$GITHUB_WORKSPACE/logs/bin-list.txt"
           exit "$rc"
 
-      # =====================================================================
-      # بطاقة الهوية (Identity Card) - تُنشأ دائمًا حتى لو فشل البناء
-      # =====================================================================
       - name: Identity Card
         if: always()
         run: |
           set +e
-          mkdir -p logs
           {
             echo "workflow       = Build OpenWrt-specified (ipq50xx/arm)"
             echo "base_repo      = hzyitc/openwrt-redmi-ax3000"
             echo "target_board   = ipq50xx"
             echo "target_sub     = arm"
             echo "target_profile = redmi_ax3000"
+            echo "include_assets = ${{ inputs.include_assets }}"
+            echo "asset_profile  = ${{ inputs.asset_profile }}"
+            echo "bh_token_set   = $([ -n '${{ inputs.bh_token }}' ] && echo yes || echo no)"
             echo "date           = $(date -u +%FT%TZ)"
             echo "runner         = $RUNNER_NAME"
             echo "--- config summary ---"
-            grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=' openwrt/.config 2>/dev/null
+            grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_luci=' openwrt/.config 2>/dev/null
             echo "--- produced images ---"
             ls -1 openwrt/bin/targets/ipq50xx/arm/*.itb \
                   openwrt/bin/targets/ipq50xx/arm/*.ubi \
                   openwrt/bin/targets/ipq50xx/arm/*.bin 2>/dev/null
-          } > logs/00-identity.txt
-          cat logs/00-identity.txt
+          } > "$GITHUB_WORKSPACE/logs/00-identity.txt"
+          cat "$GITHUB_WORKSPACE/logs/00-identity.txt"
 
-      # =====================================================================
-      # رفع المخرجات بشكل انتقائي (logs + الصور الفعلية فقط)
-      # =====================================================================
       - name: Upload Firmware Artifacts
         if: always()
         uses: actions/upload-artifact@v4
