@@ -1,0 +1,137 @@
+name: Build OpenWrt-specified-cr880x
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+          sudo apt-get update
+          sudo apt-get install -y build-essential subversion libncurses5-dev libncursesw5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip python3 python3-pip rsync swig time git-core diffstat libelf-dev libreadline-dev cmake clang libfuse-dev
+          sudo apt-get clean
+
+      - name: Clone OpenWrt Source
+        run: |
+          set +e
+          mkdir -p logs
+          git clone https://github.com/hzyitc/openwrt-redmi-ax3000.git openwrt
+          # نسخ مجلد target الخاص بك (الذي يحتوي على دعم Comfast / تعديلاتك)
+          cp -r ./target openwrt/target
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # =====================================================================
+      # إعداد الكونفيج + عرض فوري لكل ما تم تفعيله (لا انتظار حتى نهاية البناء)
+      # =====================================================================
+      - name: Configure Custom Settings + Config Proof (immediate)
+        run: |
+          set +e
+          cd openwrt
+          cp ../.config .config
+          make oldconfig
+
+          mkdir -p logs
+          echo "=== Target Info ===" | tee -a logs/config-proof.txt
+          grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=|^CONFIG_TARGET_ARCH_PACKAGES=' .config | tee -a logs/config-proof.txt
+          echo "" | tee -a logs/config-proof.txt
+
+          echo "=== Kernel / Image Options ===" | tee -a logs/config-proof.txt
+          grep -E '^CONFIG_LINUX_5_15=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_TARGET_ROOTFS_SQUASHFS=|^CONFIG_NAND_SUPPORT=|^CONFIG_GCC_VERSION=|^CONFIG_LIBC=' .config | tee -a logs/config-proof.txt
+          echo "" | tee -a logs/config-proof.txt
+
+          echo "=== Essential Packages (presence check) ===" | tee -a logs/config-proof.txt
+          for pkg in luci luci-base luci-mod-admin-full ethtool lldpd watchcat \
+                     kmod-qca-ssdk kmod-qca-nss-dp kmod-ath11k kmod-ath11k-ahb \
+                     kmod-ath11k-pci ipq-wifi-redmi_ax3000 ath11k-firmware-ipq5018 ath11k-firmware-qcn6122; do
+            if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "✅ CONFIG_PACKAGE_${pkg}=y" | tee -a logs/config-proof.txt
+            elif grep -q "^CONFIG_PACKAGE_${pkg}=m" .config; then
+              echo "🟡 CONFIG_PACKAGE_${pkg}=m" | tee -a logs/config-proof.txt
+            else
+              echo "⚠️  CONFIG_PACKAGE_${pkg} غير مفعّلة" | tee -a logs/config-proof.txt
+            fi
+          done
+          echo "" | tee -a logs/config-proof.txt
+
+          echo "=== All enabled packages (grep CONFIG_PACKAGE_*=y) ===" | tee -a logs/config-proof.txt
+          grep '^CONFIG_PACKAGE_.*=y' .config | sort | tee -a logs/config-proof.txt
+          echo "" | tee -a logs/config-proof.txt
+
+          echo "=== .config hash (for artifact matching) ===" | tee -a logs/config-proof.txt
+          sha256sum .config | tee -a logs/config-proof.txt
+          cp .config logs/config.after-oldconfig.txt
+
+      # =====================================================================
+      # البناء باستخدام كل الأنوية
+      # =====================================================================
+      - name: Compile Firmware
+        run: |
+          set +e
+          cd openwrt
+          make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
+          rc=${PIPESTATUS[0]}
+
+          echo "=== Build output directory (ipq50xx/arm) ===" | tee -a logs/bin-list.txt
+          ls -la bin/targets/ipq50xx/arm/ 2>/dev/null | tee -a logs/bin-list.txt
+          echo "" | tee -a logs/bin-list.txt
+          echo "=== Full recursive listing (for sanity) ===" | tee -a logs/bin-list.txt
+          find bin/targets -maxdepth 3 -type f 2>/dev/null | sort | tee -a logs/bin-list.txt
+
+          echo "" | tee -a logs/images.sha256
+          echo "=== SHA256 of images (itb / ubi / bin) ===" | tee -a logs/images.sha256
+          sha256sum bin/targets/ipq50xx/arm/*.itb \
+                    bin/targets/ipq50xx/arm/*.ubi \
+                    bin/targets/ipq50xx/arm/*.bin 2>/dev/null | tee -a logs/images.sha256
+          exit "$rc"
+
+      # =====================================================================
+      # بطاقة الهوية (Identity Card) - تُنشأ دائمًا حتى لو فشل البناء
+      # =====================================================================
+      - name: Identity Card
+        if: always()
+        run: |
+          set +e
+          mkdir -p logs
+          {
+            echo "workflow       = Build OpenWrt-specified (ipq50xx/arm)"
+            echo "base_repo      = hzyitc/openwrt-redmi-ax3000"
+            echo "target_board   = ipq50xx"
+            echo "target_sub     = arm"
+            echo "target_profile = redmi_ax3000"
+            echo "date           = $(date -u +%FT%TZ)"
+            echo "runner         = $RUNNER_NAME"
+            echo "--- config summary ---"
+            grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=' openwrt/.config 2>/dev/null
+            echo "--- produced images ---"
+            ls -1 openwrt/bin/targets/ipq50xx/arm/*.itb \
+                  openwrt/bin/targets/ipq50xx/arm/*.ubi \
+                  openwrt/bin/targets/ipq50xx/arm/*.bin 2>/dev/null
+          } > logs/00-identity.txt
+          cat logs/00-identity.txt
+
+      # =====================================================================
+      # رفع المخرجات بشكل انتقائي (logs + الصور الفعلية فقط)
+      # =====================================================================
+      - name: Upload Firmware Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-redmi-ax3000-firmware-${{ github.run_number }}
+          path: |
+            logs/
+            openwrt/bin/targets/ipq50xx/arm/*.itb
+            openwrt/bin/targets/ipq50xx/arm/*.ubi
+            openwrt/bin/targets/ipq50xx/arm/*.bin
+            openwrt/bin/targets/ipq50xx/arm/*.manifest
+          retention-days: 30
