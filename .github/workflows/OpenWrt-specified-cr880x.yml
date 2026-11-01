@@ -6,7 +6,7 @@ on:
       include_assets:
         description: 'Import external assets from building-helper (files/ runtime overlay + luci-theme-enan-dashboard). When FALSE, asset_profile and bh_token are completely ignored.'
         required: false
-        default: false
+        default: true
         type: boolean
       asset_profile:
         description: 'Asset profile to import (m/g/s folder from building-helper) — ONLY used when include_assets=true'
