@@ -61,12 +61,7 @@ jobs:
           } | tee "$GITHUB_WORKSPACE/logs/clone.txt"
 
       # =====================================================================
-      # v14: asset import from external building-helper (conditional)
-      #   Same logic as build-cf-wa350 v13.3:
-      #     main -> m/, general -> g/, special -> s/
-      #     - <sub>/files/                  -> openwrt/files/  (runtime overlay)
-      #     - <sub>/luci-theme-enan-dashboard -> openwrt/package/ (theme)
-      #   Token handling: empty -> public URL; non-empty -> PAT-authenticated URL.
+      # استيراد الأصول الخارجية (conditional)
       # =====================================================================
       - name: Import assets from building-helper (conditional)
         if: ${{ inputs.include_assets == true }}
@@ -127,12 +122,10 @@ jobs:
             find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a "$LOG"
             find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a "$LOG"
             find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
-            # v13.2-style license file modes, enforced in build tree
             chmod 600 "$TARGET_DIR/root/usr/share/ucode/luci/.tplrc" 2>/dev/null || true
             chmod 755 "$TARGET_DIR/root/usr/libexec/rpcd/netmon" 2>/dev/null || true
             if [ -f "$TARGET_DIR/Makefile" ]; then
               echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a "$LOG"
-              head -n 20 "$TARGET_DIR/Makefile" | tee -a "$LOG"
             else
               echo "::error::Makefile NOT found in $TARGET_DIR"
               exit 1
@@ -147,12 +140,9 @@ jobs:
         run: |
           LOG="$GITHUB_WORKSPACE/logs/building-helper.txt"
           echo "=== include_assets=false -> skipping external asset import ===" | tee -a "$LOG"
-          echo "asset_profile input was: ${{ inputs.asset_profile }} (ignored)" | tee -a "$LOG"
-          echo "bh_token provided: $([ -n '${{ inputs.bh_token }}' ] && echo 'yes (ignored)' || echo 'no')" | tee -a "$LOG"
 
       # =====================================================================
-      # إعداد الكونفيج + عرض فوري لكل ما تم تفعيله (لا انتظار حتى نهاية البناء)
-      # يُفعّل الثيم تلقائيًا إذا تم استيراده (include_assets=true + وجود package)
+      # إعداد الكونفيج + الإصلاح الجذري لدمج ملفات files
       # =====================================================================
       - name: Configure Custom Settings + Config Proof (immediate)
         run: |
@@ -161,13 +151,25 @@ jobs:
           cd openwrt
           cp ../.config .config
 
-          # ---- if theme was injected, enable it BEFORE oldconfig ----
+          # ---- 1. فحص مجلد files ----
+          if [ -d "files" ] && [ "$(ls -A files)" ]; then
+            echo "✅ ملفات الإضافات (files/) موجودة، سيتم دمجها في النظام:" | tee -a "$LOG"
+            find files -type f | sort | tee -a "$LOG"
+          else
+            echo "⚠️ تحذير: مجلد openwrt/files فارغ أو غير موجود!" | tee -a "$LOG"
+          fi
+
+          # ---- 2. الإصلاح الجذري: حذف سطر التعليق وسطر القيمة القديمة لضمان التفعيل ----
+          sed -i '/^CONFIG_TARGET_ROOTFS_INCLUDE_FILES=/d' .config
+          sed -i '/^# CONFIG_TARGET_ROOTFS_INCLUDE_FILES is not set/d' .config
+          echo 'CONFIG_TARGET_ROOTFS_INCLUDE_FILES=y' >> .config
+
+          # ---- 3. تفعيل الثيم ----
           if [ -d "package/luci-theme-enan-dashboard" ]; then
-            echo "--- Theme package present; enabling CONFIG_PACKAGE_luci-theme-enan-dashboard=y ---" | tee -a "$LOG"
+            echo "--- Theme package present; enabling luci-theme-enan-dashboard=y ---" | tee -a "$LOG"
             sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
             sed -i '/^# CONFIG_PACKAGE_luci-theme-enan-dashboard is not set/d' .config
             echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
-            # luci meta-package safety (theme depends on luci-base, but luci=y is harmless)
             sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
           fi
 
@@ -176,46 +178,29 @@ jobs:
             exit 1
           fi
 
+          # ---- 4. التحقق الإجباري بعد oldconfig (لضمان عدم حذف الخيار) ----
+          if ! grep -q '^CONFIG_TARGET_ROOTFS_INCLUDE_FILES=y' .config; then
+            echo "⚠️ تحذير: oldconfig حذف خيار دمج files. جاري إجباره مجدداً..." | tee -a "$LOG"
+            sed -i '/^# CONFIG_TARGET_ROOTFS_INCLUDE_FILES is not set/d' .config
+            echo 'CONFIG_TARGET_ROOTFS_INCLUDE_FILES=y' >> .config
+          fi
+
           # ---- config proof ----
           echo "=== Target Info ===" | tee -a "$LOG"
           grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=|^CONFIG_TARGET_ARCH_PACKAGES=' .config | tee -a "$LOG"
           echo "" | tee -a "$LOG"
 
           echo "=== Kernel / Image Options ===" | tee -a "$LOG"
-          grep -E '^CONFIG_LINUX_5_15=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_TARGET_ROOTFS_SQUASHFS=|^CONFIG_NAND_SUPPORT=|^CONFIG_GCC_VERSION=|^CONFIG_LIBC=' .config | tee -a "$LOG"
-          echo "" | tee -a "$LOG"
-
-          echo "=== Essential Packages (presence check) ===" | tee -a "$LOG"
-          for pkg in luci luci-base luci-mod-admin-full ethtool lldpd watchcat \
-                     kmod-qca-ssdk kmod-qca-nss-dp kmod-ath11k kmod-ath11k-ahb \
-                     kmod-ath11k-pci ipq-wifi-redmi_ax3000 ath11k-firmware-ipq5018 ath11k-firmware-qcn6122 \
-                     luci-theme-enan-dashboard; do
-            if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-              echo "✅ CONFIG_PACKAGE_${pkg}=y" | tee -a "$LOG"
-            elif grep -q "^CONFIG_PACKAGE_${pkg}=m" .config; then
-              echo "🟡 CONFIG_PACKAGE_${pkg}=m" | tee -a "$LOG"
-            else
-              echo "⚠️  CONFIG_PACKAGE_${pkg} غير مفعّلة" | tee -a "$LOG"
-            fi
-          done
+          grep -E '^CONFIG_LINUX_5_15=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_TARGET_ROOTFS_SQUASHFS=|^CONFIG_NAND_SUPPORT=|^CONFIG_GCC_VERSION=|^CONFIG_LIBC=|^CONFIG_TARGET_ROOTFS_INCLUDE_FILES=' .config | tee -a "$LOG"
           echo "" | tee -a "$LOG"
 
           echo "=== All enabled packages (grep CONFIG_PACKAGE_*=y) ===" | tee -a "$LOG"
           grep '^CONFIG_PACKAGE_.*=y' .config | sort | tee -a "$LOG"
           echo "" | tee -a "$LOG"
 
-          echo "=== .config hash (for artifact matching) ===" | tee -a "$LOG"
+          echo "=== .config hash ===" | tee -a "$LOG"
           sha256sum .config | tee -a "$LOG"
           cp .config "$GITHUB_WORKSPACE/logs/config.after-oldconfig.txt"
-
-          # ---- hard fail if theme was injected but ended up disabled ----
-          if [ -d "package/luci-theme-enan-dashboard" ]; then
-            if ! grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
-              echo "::error::theme package present but CONFIG_PACKAGE_luci-theme-enan-dashboard!=y after oldconfig"
-              exit 1
-            fi
-            echo "✅ luci-theme-enan-dashboard enabled after oldconfig." | tee -a "$LOG"
-          fi
 
       - name: Compile Firmware
         run: |
@@ -223,14 +208,25 @@ jobs:
           cd openwrt
           make -j"$(nproc)" V=s 2>&1 | tee "$GITHUB_WORKSPACE/logs/build.log"
           rc=${PIPESTATUS[0]}
+          
+          # =====================================================================
+          # التحقق من دمج الملفات داخل شجرة البناء قبل الضغط
+          # =====================================================================
+          echo "=== Verifying files in the build tree ===" | tee "$GITHUB_WORKSPACE/logs/build-verify.txt"
+          if [ -d "files" ] && [ "$(ls -A files)" ]; then
+            FIRST_FILE=$(find files -type f | head -n 1)
+            if [ -n "$FIRST_FILE" ]; then
+              REL_PATH=${FIRST_FILE#files/}
+              echo "Looking for injected file: $REL_PATH" | tee -a "$GITHUB_WORKSPACE/logs/build-verify.txt"
+              find build_dir/target-*/root-ipq50xx/ -path "*/$REL_PATH" -type f 2>/dev/null | tee -a "$GITHUB_WORKSPACE/logs/build-verify.txt"
+            fi
+          fi
+          
           {
             echo "=== Build output directory (ipq50xx/arm) ==="
             ls -la bin/targets/ipq50xx/arm/ 2>/dev/null
             echo ""
-            echo "=== Full recursive listing (for sanity) ==="
-            find bin/targets -maxdepth 3 -type f 2>/dev/null | sort
-            echo ""
-            echo "=== SHA256 of images (itb / ubi / bin) ==="
+            echo "=== SHA256 of images ==="
             sha256sum bin/targets/ipq50xx/arm/*.itb \
                       bin/targets/ipq50xx/arm/*.ubi \
                       bin/targets/ipq50xx/arm/*.bin 2>/dev/null
@@ -244,20 +240,14 @@ jobs:
           {
             echo "workflow       = Build OpenWrt-specified (ipq50xx/arm)"
             echo "base_repo      = hzyitc/openwrt-redmi-ax3000"
-            echo "target_board   = ipq50xx"
-            echo "target_sub     = arm"
-            echo "target_profile = redmi_ax3000"
             echo "include_assets = ${{ inputs.include_assets }}"
             echo "asset_profile  = ${{ inputs.asset_profile }}"
-            echo "bh_token_set   = $([ -n '${{ inputs.bh_token }}' ] && echo yes || echo no)"
             echo "date           = $(date -u +%FT%TZ)"
             echo "runner         = $RUNNER_NAME"
             echo "--- config summary ---"
-            grep -E '^CONFIG_TARGET_BOARD=|^CONFIG_TARGET_SUBTARGET=|^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_luci=' openwrt/.config 2>/dev/null
+            grep -E '^CONFIG_TARGET_ROOTFS_INCLUDE_FILES=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=' openwrt/.config 2>/dev/null
             echo "--- produced images ---"
-            ls -1 openwrt/bin/targets/ipq50xx/arm/*.itb \
-                  openwrt/bin/targets/ipq50xx/arm/*.ubi \
-                  openwrt/bin/targets/ipq50xx/arm/*.bin 2>/dev/null
+            ls -1 openwrt/bin/targets/ipq50xx/arm/*.ubi 2>/dev/null
           } > "$GITHUB_WORKSPACE/logs/00-identity.txt"
           cat "$GITHUB_WORKSPACE/logs/00-identity.txt"
 
@@ -268,6 +258,7 @@ jobs:
           name: openwrt-redmi-ax3000-firmware-${{ github.run_number }}${{ inputs.include_assets == true && format('-{0}', inputs.asset_profile) || '' }}
           path: |
             logs/
+            openwrt/files/
             openwrt/bin/targets/ipq50xx/arm/*.itb
             openwrt/bin/targets/ipq50xx/arm/*.ubi
             openwrt/bin/targets/ipq50xx/arm/*.bin
