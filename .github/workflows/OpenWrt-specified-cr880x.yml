@@ -75,7 +75,7 @@ jobs:
           rm -rf "$BH_DIR"
           BH_URL="$BUILDING_HELPER_REPO"
           if [ -n "$BH_TOKEN" ]; then
-            BH_URL="https://x-access-token:${BH_TOKEN}@github.com/haddad2inc/building-helper.git"
+            BH_URL="https://x-access-token:${BH_TOKEN}@github.com/haddad2inc/redmi-cr880x.git"
             echo "using dispatch-token authenticated clone (private building-helper)" | tee -a "$LOG"
           else
             echo "no bh_token provided -> using public clone URL" | tee -a "$LOG"
