@@ -24,7 +24,7 @@ on:
         type: string
 
 env:
-  BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
+  BUILDING_HELPER_REPO: https://github.com/haddad2inc/redmi-cr880x.git
 
 jobs:
   build:
